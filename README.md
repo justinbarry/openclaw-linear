@@ -24,7 +24,8 @@ Add the plugin to your OpenClaw config. Each OpenClaw instance runs one agent â€
 ```yaml
 plugins:
   linear:
-    apiKey: "lin_api_..."                # Linear API key (required)
+    apiKey: "lin_api_..."                # Linear personal API key (option A)
+    oauthToken: "oauth_token_..."        # Linear OAuth token for agent accounts (option B, takes precedence)
     webhookSecret: "your-signing-secret" # Webhook secret (required)
     agentMapping:                        # Filter: only handle events for these Linear users
       "linear-user-uuid": "titus"
@@ -44,8 +45,11 @@ plugins:
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `apiKey` | string | **Yes** | Linear API key for authentication. Create one at [linear.app/settings/account/security](https://linear.app/settings/account/security). |
+| `apiKey` | string | No* | Linear personal API key (`lin_api_...`). Create one at [linear.app/settings/account/security](https://linear.app/settings/account/security). |
+| `oauthToken` | string | No* | Linear OAuth access token for agent account authentication. If set, takes precedence over `apiKey`. The token is automatically sent with a `Bearer` prefix. |
 | `webhookSecret` | string | **Yes** | Shared secret for HMAC webhook signature verification. |
+
+\* Either `apiKey` or `oauthToken` must be provided.
 | `agentMapping` | object | No | Maps Linear user UUIDs to agent IDs. Acts as a filter â€” events for unmapped users are ignored. Since each instance runs one agent, this typically has one entry. |
 | `teamIds` | string[] | No | Team keys to scope webhook processing. Empty = all teams. |
 | `eventFilter` | string[] | No | Event types to handle (`Issue`, `Comment`). Empty = all. |

@@ -2,6 +2,8 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import {
   graphql,
   setApiKey,
+  setAuthToken,
+  buildAuthHeader,
   _resetApiKey,
   resolveIssueId,
   _resetIssueIdCache,
@@ -40,13 +42,13 @@ function mockGraphqlError(message: string) {
 }
 
 describe("graphql", () => {
-  it("throws if API key is not set", async () => {
+  it("throws if auth token is not set", async () => {
     await expect(graphql("{ viewer { id } }")).rejects.toThrow(
-      "API key not set",
+      "auth token not set",
     );
   });
 
-  it("sends correct headers and body", async () => {
+  it("sends correct headers and body with personal API key", async () => {
     setApiKey("lin_api_test123");
     mockGraphqlResponse({ viewer: { id: "u1" } });
 
@@ -61,6 +63,23 @@ describe("graphql", () => {
           "Content-Type": "application/json",
         },
         body: JSON.stringify({ query: "{ viewer { id } }" }),
+      }),
+    );
+  });
+
+  it("sends Bearer prefix for OAuth tokens", async () => {
+    setAuthToken("oauth_access_token_xyz");
+    mockGraphqlResponse({ viewer: { id: "u1" } });
+
+    await graphql("{ viewer { id } }");
+
+    expect(mockFetch).toHaveBeenCalledWith(
+      "https://api.linear.app/graphql",
+      expect.objectContaining({
+        headers: {
+          Authorization: "Bearer oauth_access_token_xyz",
+          "Content-Type": "application/json",
+        },
       }),
     );
   });
@@ -107,6 +126,26 @@ describe("graphql", () => {
     await expect(graphql("{ issue(id: \"bad\") { id } }")).rejects.toThrow(
       "Entity not found",
     );
+  });
+});
+
+describe("buildAuthHeader", () => {
+  it("returns personal API key as-is", () => {
+    expect(buildAuthHeader("lin_api_abc123")).toBe("lin_api_abc123");
+  });
+
+  it("prefixes OAuth token with Bearer", () => {
+    expect(buildAuthHeader("oauth_token_xyz")).toBe("Bearer oauth_token_xyz");
+  });
+
+  it("prefixes arbitrary non-lin_api_ token with Bearer", () => {
+    expect(buildAuthHeader("some_random_token")).toBe("Bearer some_random_token");
+  });
+});
+
+describe("setAuthToken alias", () => {
+  it("setAuthToken is an alias for setApiKey", () => {
+    expect(setAuthToken).toBe(setApiKey);
   });
 });
 

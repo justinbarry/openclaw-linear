@@ -3,7 +3,7 @@ import { createWebhookHandler } from "./webhook-handler.js";
 import { createEventRouter, type RouterAction } from "./event-router.js";
 import { InboxQueue, type EnqueueEntry } from "./work-queue.js";
 import { createQueueTool } from "./tools/queue-tool.js";
-import { setApiKey } from "./linear-api.js";
+import { setAuthToken } from "./linear-api.js";
 import { createIssueTool } from "./tools/linear-issue-tool.js";
 import { createCommentTool } from "./tools/linear-comment-tool.js";
 import { createTeamTool } from "./tools/linear-team-tool.js";
@@ -129,12 +129,18 @@ const activeDebouncerKeys = new Set<string>();
 export function activate(api: OpenClawPluginApi): void {
   api.logger.info("Linear plugin activated");
 
-  const linearApiKey = api.pluginConfig?.["apiKey"];
-  if (typeof linearApiKey !== "string" || !linearApiKey) {
-    api.logger.error("[linear] apiKey is not configured — plugin is inert");
+  const oauthToken = api.pluginConfig?.["oauthToken"];
+  const apiKey = api.pluginConfig?.["apiKey"];
+  const linearToken = typeof oauthToken === "string" && oauthToken
+    ? oauthToken
+    : typeof apiKey === "string" && apiKey
+      ? apiKey
+      : undefined;
+  if (!linearToken) {
+    api.logger.error("[linear] Neither oauthToken nor apiKey is configured — plugin is inert");
     return;
   }
-  setApiKey(linearApiKey);
+  setAuthToken(linearToken);
 
   const webhookSecret = api.pluginConfig?.["webhookSecret"];
   if (typeof webhookSecret !== "string" || !webhookSecret) {

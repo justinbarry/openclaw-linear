@@ -1,28 +1,42 @@
 const API_URL = "https://api.linear.app/graphql";
 
-let apiKey: string | undefined;
+let authToken: string | undefined;
 
-export function setApiKey(key: string): void {
-  apiKey = key;
+/**
+ * Build the Authorization header value based on token type.
+ * Personal API keys (lin_api_*) are sent as-is; OAuth tokens get a Bearer prefix.
+ */
+export function buildAuthHeader(token: string): string {
+  if (token.startsWith("lin_api_")) {
+    return token;
+  }
+  return `Bearer ${token}`;
 }
 
-/** Reset API key (for testing). */
+/** @deprecated Use setAuthToken instead. Kept for backward compatibility. */
+export function setApiKey(key: string): void {
+  authToken = key;
+}
+
+export const setAuthToken = setApiKey;
+
+/** Reset auth token (for testing). */
 export function _resetApiKey(): void {
-  apiKey = undefined;
+  authToken = undefined;
 }
 
 export async function graphql<T>(
   query: string,
   variables?: Record<string, unknown>,
 ): Promise<T> {
-  if (!apiKey) {
-    throw new Error("Linear API key not set — call setApiKey() first");
+  if (!authToken) {
+    throw new Error("Linear auth token not set — call setAuthToken() first");
   }
 
   const res = await fetch(API_URL, {
     method: "POST",
     headers: {
-      Authorization: apiKey,
+      Authorization: buildAuthHeader(authToken),
       "Content-Type": "application/json",
     },
     body: JSON.stringify({ query, variables }),
