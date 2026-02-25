@@ -1,15 +1,7 @@
 import { Type, type Static } from "@sinclair/typebox";
 import type { AnyAgentTool } from "openclaw/plugin-sdk";
 import { jsonResult, stringEnum, formatErrorMessage } from "openclaw/plugin-sdk";
-import {
-  graphql,
-  resolveIssueId,
-  resolveTeamId,
-  resolveStateId,
-  resolveUserId,
-  resolveLabelIds,
-  resolveProjectId,
-} from "../linear-api.js";
+import type { ClientRegistry } from "../linear-api.js";
 
 const Params = Type.Object({
   action: stringEnum(
@@ -83,10 +75,16 @@ const Params = Type.Object({
       description: "Max results for list (default 50).",
     }),
   ),
+  workspace: Type.Optional(
+    Type.String({
+      description:
+        "Workspace name to use (from plugin config). Defaults to the first configured workspace.",
+    }),
+  ),
 });
 type Params = Static<typeof Params>;
 
-export function createIssueTool(): AnyAgentTool {
+export function createIssueTool(registry: ClientRegistry): AnyAgentTool {
   return {
     name: "linear_issue",
     label: "Linear Issue",
@@ -95,17 +93,18 @@ export function createIssueTool(): AnyAgentTool {
     parameters: Params,
     async execute(_toolCallId: string, params: Params) {
       try {
+        const client = registry.get(params.workspace);
         switch (params.action) {
           case "view":
-            return await viewIssue(params);
+            return await viewIssue(client, params);
           case "list":
-            return await listIssues(params);
+            return await listIssues(client, params);
           case "create":
-            return await createIssue(params);
+            return await createIssue(client, params);
           case "update":
-            return await updateIssue(params);
+            return await updateIssue(client, params);
           case "delete":
-            return await deleteIssue(params);
+            return await deleteIssue(client, params);
           default:
             return jsonResult({
               error: `Unknown action: ${(params as { action: string }).action}`,
@@ -120,14 +119,16 @@ export function createIssueTool(): AnyAgentTool {
   };
 }
 
-async function viewIssue(params: Params) {
+import type { LinearClient } from "../linear-api.js";
+
+async function viewIssue(client: LinearClient, params: Params) {
   if (!params.issueId) {
     return jsonResult({ error: "issueId is required for view" });
   }
 
-  const id = await resolveIssueId(params.issueId);
+  const id = await client.resolveIssueId(params.issueId);
 
-  const data = await graphql<{ issue: Record<string, unknown> }>(
+  const data = await client.graphql<{ issue: Record<string, unknown> }>(
     `query($id: String!) {
       issue(id: $id) {
         id
@@ -156,7 +157,7 @@ async function viewIssue(params: Params) {
   return jsonResult(data.issue);
 }
 
-async function listIssues(params: Params) {
+async function listIssues(client: LinearClient, params: Params) {
   const filterParts: string[] = [];
   const variables: Record<string, unknown> = {};
 
@@ -193,7 +194,7 @@ async function listIssues(params: Params) {
   if (params.team) varDecls.push("$team: String!");
   if (params.project) varDecls.push("$project: String!");
 
-  const data = await graphql<{
+  const data = await client.graphql<{
     issues: {
       nodes: Record<string, unknown>[];
     };
@@ -222,7 +223,7 @@ async function listIssues(params: Params) {
   return jsonResult({ issues: data.issues.nodes });
 }
 
-async function createIssue(params: Params) {
+async function createIssue(client: LinearClient, params: Params) {
   if (!params.title) {
     return jsonResult({ error: "title is required for create" });
   }
@@ -230,10 +231,10 @@ async function createIssue(params: Params) {
   const input: Record<string, unknown> = { title: params.title };
 
   if (params.team) {
-    input.teamId = await resolveTeamId(params.team);
+    input.teamId = await client.resolveTeamId(params.team);
   } else {
     // Need a team — fetch the first one
-    const teams = await graphql<{
+    const teams = await client.graphql<{
       teams: { nodes: { id: string }[] };
     }>(`{ teams(first: 1) { nodes { id } } }`);
     if (teams.teams.nodes.length === 0) {
@@ -246,26 +247,26 @@ async function createIssue(params: Params) {
   if (params.priority !== undefined) input.priority = params.priority;
 
   if (params.state) {
-    input.stateId = await resolveStateId(input.teamId as string, params.state);
+    input.stateId = await client.resolveStateId(input.teamId as string, params.state);
   }
   if (params.assignee) {
-    input.assigneeId = await resolveUserId(params.assignee);
+    input.assigneeId = await client.resolveUserId(params.assignee);
   }
   if (params.project) {
-    input.projectId = await resolveProjectId(params.project);
+    input.projectId = await client.resolveProjectId(params.project);
   }
   if (params.parent) {
-    input.parentId = await resolveIssueId(params.parent);
+    input.parentId = await client.resolveIssueId(params.parent);
   }
   if (params.labels?.length) {
-    input.labelIds = await resolveLabelIds(
+    input.labelIds = await client.resolveLabelIds(
       input.teamId as string,
       params.labels,
     );
   }
   if (params.dueDate !== undefined) input.dueDate = params.dueDate || null;
 
-  const data = await graphql<{
+  const data = await client.graphql<{
     issueCreate: {
       success: boolean;
       issue: { id: string; identifier: string; url: string; title: string };
@@ -283,18 +284,18 @@ async function createIssue(params: Params) {
   return jsonResult(data.issueCreate);
 }
 
-async function updateIssue(params: Params) {
+async function updateIssue(client: LinearClient, params: Params) {
   if (!params.issueId) {
     return jsonResult({ error: "issueId is required for update" });
   }
 
-  const id = await resolveIssueId(params.issueId);
+  const id = await client.resolveIssueId(params.issueId);
   const input: Record<string, unknown> = {};
 
   // We need the team ID for state/label resolution, or the current description for append
   let teamId: string | undefined;
   if (params.state || params.labels?.length || params.appendDescription) {
-    const issueData = await graphql<{
+    const issueData = await client.graphql<{
       issue: { team: { id: string }; description?: string };
     }>(
       `query($id: String!) { issue(id: $id) { team { id } description } }`,
@@ -311,15 +312,15 @@ async function updateIssue(params: Params) {
   if (params.title) input.title = params.title;
   if (params.description !== undefined && !params.appendDescription) input.description = params.description;
   if (params.priority !== undefined) input.priority = params.priority;
-  if (params.state) input.stateId = await resolveStateId(teamId!, params.state);
-  if (params.assignee) input.assigneeId = await resolveUserId(params.assignee);
-  if (params.project) input.projectId = await resolveProjectId(params.project);
+  if (params.state) input.stateId = await client.resolveStateId(teamId!, params.state);
+  if (params.assignee) input.assigneeId = await client.resolveUserId(params.assignee);
+  if (params.project) input.projectId = await client.resolveProjectId(params.project);
   if (params.labels?.length) {
-    input.labelIds = await resolveLabelIds(teamId!, params.labels);
+    input.labelIds = await client.resolveLabelIds(teamId!, params.labels);
   }
   if (params.dueDate !== undefined) input.dueDate = params.dueDate || null;
 
-  const data = await graphql<{
+  const data = await client.graphql<{
     issueUpdate: {
       success: boolean;
       issue: { id: string; identifier: string; title: string };
@@ -337,14 +338,14 @@ async function updateIssue(params: Params) {
   return jsonResult(data.issueUpdate);
 }
 
-async function deleteIssue(params: Params) {
+async function deleteIssue(client: LinearClient, params: Params) {
   if (!params.issueId) {
     return jsonResult({ error: "issueId is required for delete" });
   }
 
-  const id = await resolveIssueId(params.issueId);
+  const id = await client.resolveIssueId(params.issueId);
 
-  const data = await graphql<{
+  const data = await client.graphql<{
     issueDelete: { success: boolean };
   }>(
     `mutation($id: String!) {

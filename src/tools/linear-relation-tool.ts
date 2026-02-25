@@ -1,7 +1,7 @@
 import { Type, type Static } from "@sinclair/typebox";
 import type { AnyAgentTool } from "openclaw/plugin-sdk";
 import { jsonResult, stringEnum, optionalStringEnum, formatErrorMessage } from "openclaw/plugin-sdk";
-import { graphql, resolveIssueId } from "../linear-api.js";
+import type { ClientRegistry, LinearClient } from "../linear-api.js";
 
 const RELATION_TYPE_MAP: Record<string, string> = {
   blocks: "blocks",
@@ -43,10 +43,16 @@ const Params = Type.Object({
       description: "Relation ID. Required for delete.",
     }),
   ),
+  workspace: Type.Optional(
+    Type.String({
+      description:
+        "Workspace name to use (from plugin config). Defaults to the first configured workspace.",
+    }),
+  ),
 });
 type Params = Static<typeof Params>;
 
-export function createRelationTool(): AnyAgentTool {
+export function createRelationTool(registry: ClientRegistry): AnyAgentTool {
   return {
     name: "linear_relation",
     label: "Linear Relation",
@@ -55,13 +61,14 @@ export function createRelationTool(): AnyAgentTool {
     parameters: Params,
     async execute(_toolCallId: string, params: Params) {
       try {
+        const client = registry.get(params.workspace);
         switch (params.action) {
           case "list":
-            return await listRelations(params);
+            return await listRelations(client, params);
           case "add":
-            return await addRelation(params);
+            return await addRelation(client, params);
           case "delete":
-            return await deleteRelation(params);
+            return await deleteRelation(client, params);
           default:
             return jsonResult({
               error: `Unknown action: ${(params as { action: string }).action}`,
@@ -76,14 +83,14 @@ export function createRelationTool(): AnyAgentTool {
   };
 }
 
-async function listRelations(params: Params) {
+async function listRelations(client: LinearClient, params: Params) {
   if (!params.issueId) {
     return jsonResult({ error: "issueId is required for list" });
   }
 
-  const id = await resolveIssueId(params.issueId);
+  const id = await client.resolveIssueId(params.issueId);
 
-  const data = await graphql<{
+  const data = await client.graphql<{
     issue: {
       relations: {
         nodes: {
@@ -140,7 +147,7 @@ async function listRelations(params: Params) {
   });
 }
 
-async function addRelation(params: Params) {
+async function addRelation(client: LinearClient, params: Params) {
   if (!params.issueId) {
     return jsonResult({ error: "issueId is required for add" });
   }
@@ -161,14 +168,14 @@ async function addRelation(params: Params) {
   let relatedIssueId: string;
 
   if (params.type === "blocked-by") {
-    issueId = await resolveIssueId(params.relatedIssueId);
-    relatedIssueId = await resolveIssueId(params.issueId);
+    issueId = await client.resolveIssueId(params.relatedIssueId);
+    relatedIssueId = await client.resolveIssueId(params.issueId);
   } else {
-    issueId = await resolveIssueId(params.issueId);
-    relatedIssueId = await resolveIssueId(params.relatedIssueId);
+    issueId = await client.resolveIssueId(params.issueId);
+    relatedIssueId = await client.resolveIssueId(params.relatedIssueId);
   }
 
-  const data = await graphql<{
+  const data = await client.graphql<{
     issueRelationCreate: {
       success: boolean;
       issueRelation: { id: string; type: string };
@@ -192,12 +199,12 @@ async function addRelation(params: Params) {
   return jsonResult(data.issueRelationCreate);
 }
 
-async function deleteRelation(params: Params) {
+async function deleteRelation(client: LinearClient, params: Params) {
   if (!params.relationId) {
     return jsonResult({ error: "relationId is required for delete" });
   }
 
-  const data = await graphql<{
+  const data = await client.graphql<{
     issueRelationDelete: { success: boolean };
   }>(
     `mutation($id: String!) {

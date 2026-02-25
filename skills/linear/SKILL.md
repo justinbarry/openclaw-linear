@@ -1,12 +1,20 @@
 ---
 name: linear
-description: Linear project management integration. Provides tools for processing a notification queue, managing issues, comments, teams, projects, and issue relations via the Linear GraphQL API.
+description: Linear project management integration. Provides tools for processing a notification queue, managing issues, comments, teams, projects, and issue relations via the Linear GraphQL API. Supports multiple workspaces.
 metadata: { "openclaw": { "always": true } }
 ---
 
 # Linear
 
 You have Linear tools for managing issues and responding to notifications. These tools call the Linear GraphQL API directly — they handle auth, formatting, and error handling for you.
+
+## Multiple Workspaces
+
+When multiple workspaces are configured, every tool accepts an optional `workspace` parameter. If omitted, the first configured workspace is used.
+
+To check which workspaces are available, look at the plugin config. Workspace names are the keys under `workspaces` in the config.
+
+Example: `linear_issue { action: "list", workspace: "partner" }`
 
 ## Tools
 
@@ -20,6 +28,8 @@ Manages the queue of Linear notifications routed to you by webhooks.
 | `pop` | Claim the highest-priority pending item (marks it `in_progress`). |
 | `drain` | Claim all pending items (marks them `in_progress`). |
 | `complete` | Finish work on a claimed item (requires `issueId`). Removes it from the queue. |
+
+All actions accept an optional `workspace` parameter to target a specific workspace's queue.
 
 Queue items have this shape:
 

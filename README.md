@@ -10,7 +10,43 @@ openclaw plugins install openclaw-linear
 
 ## Configuration
 
-Each OpenClaw instance runs one agent — configure a separate instance per agent.
+### Multi-Workspace (recommended)
+
+Configure multiple Linear workspaces under `workspaces`. Each key is a workspace name used by tools and webhook routing.
+
+```yaml
+plugins:
+  linear:
+    workspaces:
+      main:
+        apiKey: "lin_api_..."              # Linear API key (required)
+        webhookSecret: "secret-main"       # Webhook secret (required)
+        agentMapping:
+          "linear-user-uuid": "titus"
+        teamIds: ["ENG", "OPS"]
+        eventFilter: ["Issue", "Comment"]
+        debounceMs: 30000
+        stateActions:
+          backlog: "add"
+          completed: "remove"
+      partner:
+        apiKey: "lin_api_..."              # Different workspace's API key
+        webhookSecret: "secret-partner"
+        agentMapping:
+          "partner-user-uuid": "titus"
+        teamIds: ["PROD"]
+```
+
+With multiple workspaces:
+- Webhook endpoints are registered at `/hooks/linear/<workspace>` (e.g. `/hooks/linear/main`, `/hooks/linear/partner`)
+- Work queues are namespaced per workspace (`queue/main/inbox.jsonl`, `queue/partner/inbox.jsonl`)
+- All tools accept an optional `workspace` parameter (defaults to first configured workspace)
+
+Example: `linear_issue { action: "list", team: "PROD", workspace: "partner" }`
+
+### Single Workspace (legacy)
+
+The flat config format is still supported and behaves identically to previous versions.
 
 ```yaml
 plugins:
@@ -31,16 +67,20 @@ plugins:
       canceled: "remove"
 ```
 
+With a single workspace, the webhook registers at `/hooks/linear` (unchanged) and tools work without specifying `workspace`.
+
 ### Config Fields
+
+Each workspace (or the flat config) accepts these fields:
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `apiKey` | string | **Yes** | Linear API key. Create at [linear.app/settings/account/security](https://linear.app/settings/account/security). |
 | `webhookSecret` | string | **Yes** | Shared secret for HMAC webhook signature verification. |
-| `agentMapping` | object | No | Maps Linear user UUIDs to agent IDs. Acts as a filter — events for unmapped users are ignored. Since each instance runs one agent, this typically has one entry. |
+| `agentMapping` | object | No | Maps Linear user UUIDs to agent IDs. Acts as a filter — events for unmapped users are ignored. |
 | `teamIds` | string[] | No | Team keys to scope webhook processing. Empty = all teams. |
 | `eventFilter` | string[] | No | Event types to handle (`Issue`, `Comment`). Empty = all. |
-| `debounceMs` | integer | No | Debounce window in milliseconds. Events within this window are batched into a single dispatch. Default: `30000` (30s). |
+| `debounceMs` | integer | No | Debounce window in milliseconds. Default: `30000` (30s). |
 | `stateActions` | object | No | Maps Linear state types or names to queue actions (`"add"`, `"remove"`, `"ignore"`). See [State Actions](#state-actions). |
 
 ## Webhook Setup
@@ -53,10 +93,11 @@ plugins:
 
 2. **Register the webhook in Linear:**
    - Go to **Settings > API > Webhooks**
-   - Set the URL to `https://your-host/hooks/linear`
-   - Set the secret to match your `webhookSecret`
+   - Set the URL to `https://your-host/hooks/linear` (single workspace) or `https://your-host/hooks/linear/<name>` (multi-workspace)
+   - Set the secret to match your `webhookSecret` for that workspace
    - Select event types: Issues, Comments
    - Save
+   - **Multi-workspace:** Register a separate webhook in each Linear workspace, each pointing to its own `/hooks/linear/<name>` endpoint
 
 3. **Verify:** Assign a Linear issue to a mapped user — the agent should receive a notification.
 

@@ -1,206 +1,332 @@
 const API_URL = "https://api.linear.app/graphql";
 
-let apiKey: string | undefined;
+// ---------------------------------------------------------------------------
+// LinearClient — per-workspace API client
+// ---------------------------------------------------------------------------
 
-export function setApiKey(key: string): void {
-  apiKey = key;
+export class LinearClient {
+  private readonly apiKey: string;
+  private readonly issueIdCache = new Map<string, string>();
+
+  constructor(apiKey: string) {
+    this.apiKey = apiKey;
+  }
+
+  async graphql<T>(
+    query: string,
+    variables?: Record<string, unknown>,
+  ): Promise<T> {
+    const res = await fetch(API_URL, {
+      method: "POST",
+      headers: {
+        Authorization: this.apiKey,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ query, variables }),
+    });
+
+    if (!res.ok) {
+      let detail = res.statusText;
+      try {
+        const body = await res.text();
+        if (body) detail += `: ${body}`;
+      } catch {
+        // ignore read errors
+      }
+      throw new Error(`Linear API HTTP ${res.status}: ${detail}`);
+    }
+
+    const json = (await res.json()) as {
+      data?: T;
+      errors?: { message: string }[];
+    };
+
+    if (json.errors?.length) {
+      throw new Error(`Linear API error: ${json.errors[0].message}`);
+    }
+
+    return json.data as T;
+  }
+
+  async resolveIssueId(identifier: string): Promise<string> {
+    const cached = this.issueIdCache.get(identifier);
+    if (cached) return cached;
+
+    const match = identifier.match(/^([A-Za-z]+)-(\d+)$/);
+    if (!match) {
+      throw new Error(`Invalid issue identifier format: ${identifier} (expected e.g. ENG-123)`);
+    }
+
+    const [, teamKey, numStr] = match;
+    const num = parseInt(numStr, 10);
+
+    const data = await this.graphql<{
+      issues: { nodes: { id: string }[] };
+    }>(
+      `query($teamKey: String!, $num: Float!) {
+        issues(filter: { team: { key: { eq: $teamKey } }, number: { eq: $num } }) {
+          nodes { id }
+        }
+      }`,
+      { teamKey: teamKey.toUpperCase(), num },
+    );
+
+    if (data.issues.nodes.length === 0) {
+      throw new Error(`Issue ${identifier} not found`);
+    }
+
+    const id = data.issues.nodes[0].id;
+    this.issueIdCache.set(identifier, id);
+    return id;
+  }
+
+  /** Reset issue ID cache (for testing). */
+  _resetIssueIdCache(): void {
+    this.issueIdCache.clear();
+  }
+
+  async resolveTeamId(key: string): Promise<string> {
+    const data = await this.graphql<{
+      teams: { nodes: { id: string }[] };
+    }>(
+      `query($key: String!) {
+        teams(filter: { key: { eq: $key } }) {
+          nodes { id }
+        }
+      }`,
+      { key: key.toUpperCase() },
+    );
+
+    if (data.teams.nodes.length === 0) {
+      throw new Error(`Team with key "${key}" not found`);
+    }
+    return data.teams.nodes[0].id;
+  }
+
+  async resolveStateId(
+    teamId: string,
+    stateName: string,
+  ): Promise<string> {
+    const data = await this.graphql<{
+      team: { states: { nodes: { id: string; name: string }[] } };
+    }>(
+      `query($teamId: String!) {
+        team(id: $teamId) {
+          states { nodes { id name } }
+        }
+      }`,
+      { teamId },
+    );
+
+    const lowerName = stateName.toLowerCase();
+    const match = data.team.states.nodes.find(
+      (s) => s.name.toLowerCase() === lowerName,
+    );
+
+    if (!match) {
+      const available = data.team.states.nodes.map((s) => s.name).join(", ");
+      throw new Error(
+        `Workflow state "${stateName}" not found. Available states: ${available}`,
+      );
+    }
+    return match.id;
+  }
+
+  async resolveUserId(nameOrEmail: string): Promise<string> {
+    const data = await this.graphql<{
+      users: { nodes: { id: string }[] };
+    }>(
+      `query($term: String!) {
+        users(filter: { or: [{ name: { eqIgnoreCase: $term } }, { email: { eq: $term } }] }) {
+          nodes { id }
+        }
+      }`,
+      { term: nameOrEmail },
+    );
+
+    if (data.users.nodes.length === 0) {
+      throw new Error(`User "${nameOrEmail}" not found`);
+    }
+    return data.users.nodes[0].id;
+  }
+
+  async resolveLabelIds(
+    teamId: string,
+    names: string[],
+  ): Promise<string[]> {
+    const data = await this.graphql<{
+      team: { labels: { nodes: { id: string; name: string }[] } };
+    }>(
+      `query($teamId: String!) {
+        team(id: $teamId) {
+          labels { nodes { id name } }
+        }
+      }`,
+      { teamId },
+    );
+
+    const labelMap = new Map(
+      data.team.labels.nodes.map((l) => [l.name.toLowerCase(), l.id]),
+    );
+
+    const ids: string[] = [];
+    for (const name of names) {
+      const id = labelMap.get(name.toLowerCase());
+      if (!id) {
+        throw new Error(`Label "${name}" not found in team`);
+      }
+      ids.push(id);
+    }
+    return ids;
+  }
+
+  async resolveProjectId(name: string): Promise<string> {
+    const data = await this.graphql<{
+      projects: { nodes: { id: string; name: string }[] };
+    }>(
+      `query($name: String!) {
+        projects(filter: { name: { eqIgnoreCase: $name } }) {
+          nodes { id name }
+        }
+      }`,
+      { name },
+    );
+
+    if (data.projects.nodes.length === 0) {
+      throw new Error(`Project "${name}" not found`);
+    }
+    return data.projects.nodes[0].id;
+  }
 }
 
-/** Reset API key (for testing). */
+// ---------------------------------------------------------------------------
+// ClientRegistry — manages named workspace clients
+// ---------------------------------------------------------------------------
+
+export class ClientRegistry {
+  private readonly clients = new Map<string, LinearClient>();
+  private defaultName: string | undefined;
+
+  register(name: string, apiKey: string): LinearClient {
+    const client = new LinearClient(apiKey);
+    this.clients.set(name, client);
+    if (!this.defaultName) this.defaultName = name;
+    return client;
+  }
+
+  get(name?: string): LinearClient {
+    if (!name) {
+      if (!this.defaultName) {
+        throw new Error("No Linear workspaces configured");
+      }
+      return this.clients.get(this.defaultName)!;
+    }
+    const client = this.clients.get(name);
+    if (!client) {
+      const available = [...this.clients.keys()].join(", ");
+      throw new Error(
+        `Unknown workspace "${name}". Available: ${available}`,
+      );
+    }
+    return client;
+  }
+
+  names(): string[] {
+    return [...this.clients.keys()];
+  }
+
+  defaultWorkspace(): string | undefined {
+    return this.defaultName;
+  }
+
+  size(): number {
+    return this.clients.size;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Module-level singleton (backward compat for existing code paths)
+// ---------------------------------------------------------------------------
+
+let _registry: ClientRegistry | undefined;
+
+/** Set the global registry (called from plugin activate). */
+export function setRegistry(r: ClientRegistry): void {
+  _registry = r;
+}
+
+/** Get the global registry. */
+export function getRegistry(): ClientRegistry {
+  if (!_registry) {
+    throw new Error("Linear client registry not initialized");
+  }
+  return _registry;
+}
+
+// --- Legacy shims (backward compat for tests and simple usage) ---
+
+let _legacyApiKey: string | undefined;
+
+export function setApiKey(key: string): void {
+  _legacyApiKey = key;
+  // Also set up a registry with a "default" workspace
+  const reg = new ClientRegistry();
+  reg.register("default", key);
+  setRegistry(reg);
+}
+
 export function _resetApiKey(): void {
-  apiKey = undefined;
+  _legacyApiKey = undefined;
+  _registry = undefined;
 }
 
 export async function graphql<T>(
   query: string,
   variables?: Record<string, unknown>,
 ): Promise<T> {
-  if (!apiKey) {
-    throw new Error("Linear API key not set — call setApiKey() first");
-  }
-
-  const res = await fetch(API_URL, {
-    method: "POST",
-    headers: {
-      Authorization: apiKey,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ query, variables }),
-  });
-
-  if (!res.ok) {
-    let detail = res.statusText;
-    try {
-      const body = await res.text();
-      if (body) detail += `: ${body}`;
-    } catch {
-      // ignore read errors
+  if (!_registry) {
+    if (!_legacyApiKey) {
+      throw new Error("Linear API key not set — call setApiKey() first");
     }
-    throw new Error(`Linear API HTTP ${res.status}: ${detail}`);
+    setApiKey(_legacyApiKey);
   }
-
-  const json = (await res.json()) as {
-    data?: T;
-    errors?: { message: string }[];
-  };
-
-  if (json.errors?.length) {
-    throw new Error(`Linear API error: ${json.errors[0].message}`);
-  }
-
-  return json.data as T;
+  return _registry!.get().graphql<T>(query, variables);
 }
-
-// --- Name/ID resolution helpers ---
-
-const issueIdCache = new Map<string, string>();
 
 export async function resolveIssueId(identifier: string): Promise<string> {
-  const cached = issueIdCache.get(identifier);
-  if (cached) return cached;
-
-  const match = identifier.match(/^([A-Za-z]+)-(\d+)$/);
-  if (!match) {
-    throw new Error(`Invalid issue identifier format: ${identifier} (expected e.g. ENG-123)`);
-  }
-
-  const [, teamKey, numStr] = match;
-  const num = parseInt(numStr, 10);
-
-  const data = await graphql<{
-    issues: { nodes: { id: string }[] };
-  }>(
-    `query($teamKey: String!, $num: Float!) {
-      issues(filter: { team: { key: { eq: $teamKey } }, number: { eq: $num } }) {
-        nodes { id }
-      }
-    }`,
-    { teamKey: teamKey.toUpperCase(), num },
-  );
-
-  if (data.issues.nodes.length === 0) {
-    throw new Error(`Issue ${identifier} not found`);
-  }
-
-  const id = data.issues.nodes[0].id;
-  issueIdCache.set(identifier, id);
-  return id;
+  return getRegistry().get().resolveIssueId(identifier);
 }
 
-/** Reset issue ID cache (for testing). */
 export function _resetIssueIdCache(): void {
-  issueIdCache.clear();
+  if (_registry) {
+    for (const name of _registry.names()) {
+      _registry.get(name)._resetIssueIdCache();
+    }
+  }
 }
 
 export async function resolveTeamId(key: string): Promise<string> {
-  const data = await graphql<{
-    teams: { nodes: { id: string }[] };
-  }>(
-    `query($key: String!) {
-      teams(filter: { key: { eq: $key } }) {
-        nodes { id }
-      }
-    }`,
-    { key: key.toUpperCase() },
-  );
-
-  if (data.teams.nodes.length === 0) {
-    throw new Error(`Team with key "${key}" not found`);
-  }
-  return data.teams.nodes[0].id;
+  return getRegistry().get().resolveTeamId(key);
 }
 
 export async function resolveStateId(
   teamId: string,
   stateName: string,
 ): Promise<string> {
-  const data = await graphql<{
-    team: { states: { nodes: { id: string; name: string }[] } };
-  }>(
-    `query($teamId: String!) {
-      team(id: $teamId) {
-        states { nodes { id name } }
-      }
-    }`,
-    { teamId },
-  );
-
-  const lowerName = stateName.toLowerCase();
-  const match = data.team.states.nodes.find(
-    (s) => s.name.toLowerCase() === lowerName,
-  );
-
-  if (!match) {
-    const available = data.team.states.nodes.map((s) => s.name).join(", ");
-    throw new Error(
-      `Workflow state "${stateName}" not found. Available states: ${available}`,
-    );
-  }
-  return match.id;
+  return getRegistry().get().resolveStateId(teamId, stateName);
 }
 
 export async function resolveUserId(nameOrEmail: string): Promise<string> {
-  const data = await graphql<{
-    users: { nodes: { id: string }[] };
-  }>(
-    `query($term: String!) {
-      users(filter: { or: [{ name: { eqIgnoreCase: $term } }, { email: { eq: $term } }] }) {
-        nodes { id }
-      }
-    }`,
-    { term: nameOrEmail },
-  );
-
-  if (data.users.nodes.length === 0) {
-    throw new Error(`User "${nameOrEmail}" not found`);
-  }
-  return data.users.nodes[0].id;
+  return getRegistry().get().resolveUserId(nameOrEmail);
 }
 
 export async function resolveLabelIds(
   teamId: string,
   names: string[],
 ): Promise<string[]> {
-  const data = await graphql<{
-    team: { labels: { nodes: { id: string; name: string }[] } };
-  }>(
-    `query($teamId: String!) {
-      team(id: $teamId) {
-        labels { nodes { id name } }
-      }
-    }`,
-    { teamId },
-  );
-
-  const labelMap = new Map(
-    data.team.labels.nodes.map((l) => [l.name.toLowerCase(), l.id]),
-  );
-
-  const ids: string[] = [];
-  for (const name of names) {
-    const id = labelMap.get(name.toLowerCase());
-    if (!id) {
-      throw new Error(`Label "${name}" not found in team`);
-    }
-    ids.push(id);
-  }
-  return ids;
+  return getRegistry().get().resolveLabelIds(teamId, names);
 }
 
 export async function resolveProjectId(name: string): Promise<string> {
-  const data = await graphql<{
-    projects: { nodes: { id: string; name: string }[] };
-  }>(
-    `query($name: String!) {
-      projects(filter: { name: { eqIgnoreCase: $name } }) {
-        nodes { id name }
-      }
-    }`,
-    { name },
-  );
-
-  if (data.projects.nodes.length === 0) {
-    throw new Error(`Project "${name}" not found`);
-  }
-  return data.projects.nodes[0].id;
+  return getRegistry().get().resolveProjectId(name);
 }

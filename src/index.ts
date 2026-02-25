@@ -3,8 +3,8 @@ import { formatErrorMessage } from "openclaw/plugin-sdk";
 import { createWebhookHandler } from "./webhook-handler.js";
 import { createEventRouter, type RouterAction } from "./event-router.js";
 import { InboxQueue, type EnqueueEntry } from "./work-queue.js";
-import { createQueueTool } from "./tools/queue-tool.js";
-import { setApiKey } from "./linear-api.js";
+import { createQueueTool, type QueueResolver } from "./tools/queue-tool.js";
+import { ClientRegistry, setRegistry } from "./linear-api.js";
 import { createIssueTool } from "./tools/linear-issue-tool.js";
 import { createCommentTool } from "./tools/linear-comment-tool.js";
 import { createTeamTool } from "./tools/linear-team-tool.js";
@@ -50,6 +50,70 @@ function formatActionSummary(action: RouterAction): string {
 
   return action.issueLabel || action.detail;
 }
+
+// ---------------------------------------------------------------------------
+// Workspace config types
+// ---------------------------------------------------------------------------
+
+interface WorkspaceConfig {
+  apiKey: string;
+  webhookSecret: string;
+  agentMapping?: Record<string, string>;
+  teamIds?: string[];
+  eventFilter?: string[];
+  debounceMs?: number;
+  stateActions?: Record<string, string>;
+}
+
+/** Parse plugin config into a map of workspace name → config.
+ *  Supports both the legacy flat config and the new `workspaces` map. */
+function parseWorkspaces(
+  pluginConfig: Record<string, unknown>,
+): Map<string, WorkspaceConfig> {
+  const workspaces = new Map<string, WorkspaceConfig>();
+
+  const raw = pluginConfig["workspaces"];
+  if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+    // New multi-workspace config
+    for (const [name, ws] of Object.entries(raw as Record<string, Record<string, unknown>>)) {
+      const apiKey = ws["apiKey"] as string | undefined;
+      const webhookSecret = ws["webhookSecret"] as string | undefined;
+      if (!apiKey || !webhookSecret) continue;
+      workspaces.set(name, {
+        apiKey,
+        webhookSecret,
+        agentMapping: (ws["agentMapping"] as Record<string, string>) ?? {},
+        teamIds: (ws["teamIds"] as string[]) ?? [],
+        eventFilter: (ws["eventFilter"] as string[]) ?? [],
+        debounceMs: ws["debounceMs"] as number | undefined,
+        stateActions: (ws["stateActions"] as Record<string, string>) ?? undefined,
+      });
+    }
+  }
+
+  // Legacy flat config (single workspace named "default")
+  if (workspaces.size === 0) {
+    const apiKey = pluginConfig["apiKey"] as string | undefined;
+    const webhookSecret = pluginConfig["webhookSecret"] as string | undefined;
+    if (apiKey && webhookSecret) {
+      workspaces.set("default", {
+        apiKey,
+        webhookSecret,
+        agentMapping: (pluginConfig["agentMapping"] as Record<string, string>) ?? {},
+        teamIds: (pluginConfig["teamIds"] as string[]) ?? [],
+        eventFilter: (pluginConfig["eventFilter"] as string[]) ?? [],
+        debounceMs: pluginConfig["debounceMs"] as number | undefined,
+        stateActions: (pluginConfig["stateActions"] as Record<string, string>) ?? undefined,
+      });
+    }
+  }
+
+  return workspaces;
+}
+
+// ---------------------------------------------------------------------------
+// Dispatch
+// ---------------------------------------------------------------------------
 
 async function dispatchConsolidatedActions(
   actions: RouterAction[],
@@ -125,64 +189,84 @@ async function dispatchConsolidatedActions(
   });
 }
 
+// ---------------------------------------------------------------------------
+// Plugin lifecycle
+// ---------------------------------------------------------------------------
+
 let activeDebouncer: { flushKey: (key: string) => Promise<void> } | undefined;
 const activeDebouncerKeys = new Set<string>();
 
 export function activate(api: OpenClawPluginApi): void {
   api.logger.info("Linear plugin activated");
 
-  const linearApiKey = api.pluginConfig?.["apiKey"];
-  if (typeof linearApiKey !== "string" || !linearApiKey) {
-    api.logger.error("[linear] apiKey is not configured — plugin is inert");
-    return;
-  }
-  setApiKey(linearApiKey);
+  const pluginConfig = (api.pluginConfig ?? {}) as Record<string, unknown>;
+  const workspaces = parseWorkspaces(pluginConfig);
 
-  const webhookSecret = api.pluginConfig?.["webhookSecret"];
-  if (typeof webhookSecret !== "string" || !webhookSecret) {
-    api.logger.error("[linear] webhookSecret is not configured — plugin is inert");
+  if (workspaces.size === 0) {
+    api.logger.error("[linear] No workspaces configured (need apiKey + webhookSecret) — plugin is inert");
     return;
   }
 
-  const agentMapping =
-    (api.pluginConfig?.["agentMapping"] as Record<string, string>) ?? {};
-  if (Object.keys(agentMapping).length === 0) {
-    api.logger.info("[linear] agentMapping is empty — all events will be dropped");
+  // --- Build client registry ---
+  const registry = new ClientRegistry();
+  for (const [name, ws] of workspaces) {
+    registry.register(name, ws.apiKey);
+  }
+  setRegistry(registry);
+
+  api.logger.info(
+    `[linear] ${workspaces.size} workspace(s) configured: ${[...workspaces.keys()].join(", ")}`,
+  );
+
+  // --- Build per-workspace queues ---
+  const queues = new Map<string, InboxQueue>();
+  for (const name of workspaces.keys()) {
+    const queuePath =
+      workspaces.size === 1
+        ? api.resolvePath("queue/inbox.jsonl")
+        : api.resolvePath(`queue/${name}/inbox.jsonl`);
+    queues.set(name, new InboxQueue(queuePath));
   }
 
-  const eventFilter =
-    (api.pluginConfig?.["eventFilter"] as string[]) ?? [];
-  const teamIds =
-    (api.pluginConfig?.["teamIds"] as string[]) ?? [];
-  const rawDebounceMs = api.pluginConfig?.["debounceMs"] as number | undefined;
-  const debounceMs =
-    (typeof rawDebounceMs === "number" && rawDebounceMs > 0)
-      ? rawDebounceMs
-      : DEFAULT_DEBOUNCE_MS;
+  // Queue resolver for the tool
+  const resolveQueue: QueueResolver = (workspace?: string) => {
+    if (!workspace) {
+      // Default to first workspace
+      const first = queues.values().next().value;
+      if (!first) throw new Error("No queues configured");
+      return first;
+    }
+    const q = queues.get(workspace);
+    if (!q) {
+      const available = [...queues.keys()].join(", ");
+      throw new Error(`Unknown workspace "${workspace}". Available: ${available}`);
+    }
+    return q;
+  };
+
+  // Recover stale in_progress items from all queues
+  for (const [name, queue] of queues) {
+    queue.recover().then((count) => {
+      if (count > 0) {
+        api.logger.info(`[linear:${name}] Recovered ${count} stale in_progress queue item(s)`);
+      }
+    }).catch((err) => {
+      api.logger.error(
+        `[linear:${name}] Queue recovery failed: ${formatErrorMessage(err)}`,
+      );
+    });
+  }
+
+  // --- Register tools (once, workspace-aware) ---
+  api.registerTool(createQueueTool(resolveQueue));
+  api.registerTool(createIssueTool(registry));
+  api.registerTool(createCommentTool(registry));
+  api.registerTool(createTeamTool(registry));
+  api.registerTool(createProjectTool(registry));
+  api.registerTool(createRelationTool(registry));
 
   const core = api.runtime;
   const cfg = api.config;
-
-  const queuePath = api.resolvePath("queue/inbox.jsonl");
-  const queue = new InboxQueue(queuePath);
-
-  // Recover any stale in_progress items from a previous crash
-  queue.recover().then((count) => {
-    if (count > 0) {
-      api.logger.info(`[linear] Recovered ${count} stale in_progress queue item(s)`);
-    }
-  }).catch((err) => {
-    api.logger.error(
-      `[linear] Queue recovery failed: ${formatErrorMessage(err)}`,
-    );
-  });
-
-  api.registerTool(createQueueTool(queue));
-  api.registerTool(createIssueTool());
-  api.registerTool(createCommentTool());
-  api.registerTool(createTeamTool());
-  api.registerTool(createProjectTool());
-  api.registerTool(createRelationTool());
 
   // Auto-wake: after a "complete" action, dispatch a fresh session if items remain
   api.on("after_tool_call", async (event) => {
@@ -190,10 +274,14 @@ export function activate(api: OpenClawPluginApi): void {
     if (event.params.action !== "complete") return;
     if (event.error) return;
 
-    const remaining = await queue.peek();
-    if (remaining.length === 0) return;
+    // Check all queues for remaining items
+    let totalRemaining = 0;
+    for (const queue of queues.values()) {
+      const remaining = await queue.peek();
+      totalRemaining += remaining.length;
+    }
+    if (totalRemaining === 0) return;
 
-    const remainingCount = remaining.length;
     const peerId = `queue-wake-${Date.now()}`;
     const route = core.channel.routing.resolveAgentRoute({
       cfg,
@@ -202,7 +290,7 @@ export function activate(api: OpenClawPluginApi): void {
       peer: { kind: "direct" as const, id: peerId },
     });
 
-    const body = `${remainingCount} item(s) remaining in queue. Use the linear_queue tool to continue processing.`;
+    const body = `${totalRemaining} item(s) remaining in queue. Use the linear_queue tool to continue processing.`;
 
     const ctx = core.channel.reply.finalizeInboundContext({
       Body: body,
@@ -214,7 +302,7 @@ export function activate(api: OpenClawPluginApi): void {
       SessionKey: route.sessionKey,
       AccountId: route.accountId ?? "default",
       ChatType: "direct",
-      ConversationLabel: `Linear: queue check (${remainingCount} remaining)`,
+      ConversationLabel: `Linear: queue check (${totalRemaining} remaining)`,
       SenderId: peerId,
       Provider: CHANNEL_ID,
       Surface: CHANNEL_ID,
@@ -240,23 +328,36 @@ export function activate(api: OpenClawPluginApi): void {
     });
   });
 
-  const stateActions =
-    (api.pluginConfig?.["stateActions"] as Record<string, string>) ?? undefined;
+  // --- Per-workspace webhook + event routing ---
+  // Use a shared debouncer across all workspaces (keyed by agentId)
+  const rawDebounceMs = pluginConfig["debounceMs"] as number | undefined;
+  const globalDebounceMs =
+    (typeof rawDebounceMs === "number" && rawDebounceMs > 0)
+      ? rawDebounceMs
+      : DEFAULT_DEBOUNCE_MS;
 
-  const routeEvent = createEventRouter({
-    agentMapping,
-    logger: api.logger,
-    eventFilter: eventFilter.length ? eventFilter : undefined,
-    teamIds: teamIds.length ? teamIds : undefined,
-    stateActions,
-  });
+  // Collect all queues that a debounced action should flush to
+  // We key debounce by agentId; action carries workspaceName to pick the right queue
+  type WorkspaceAction = RouterAction & { workspaceName: string };
 
-  const debouncer = api.runtime.channel.debounce.createInboundDebouncer<RouterAction>({
-    debounceMs,
+  const debouncer = api.runtime.channel.debounce.createInboundDebouncer<WorkspaceAction>({
+    debounceMs: globalDebounceMs,
     buildKey: (action) => action.agentId,
     shouldDebounce: () => true,
     onFlush: async (actions) => {
-      await dispatchConsolidatedActions(actions, api, queue);
+      // Group actions by workspace and dispatch each group to its own queue
+      const byWorkspace = new Map<string, WorkspaceAction[]>();
+      for (const a of actions) {
+        const list = byWorkspace.get(a.workspaceName) ?? [];
+        list.push(a);
+        byWorkspace.set(a.workspaceName, list);
+      }
+      for (const [wsName, wsActions] of byWorkspace) {
+        const queue = queues.get(wsName);
+        if (queue) {
+          await dispatchConsolidatedActions(wsActions, api, queue);
+        }
+      }
     },
     onError: (err) => {
       api.logger.error(
@@ -266,50 +367,77 @@ export function activate(api: OpenClawPluginApi): void {
   });
   activeDebouncer = debouncer;
 
-  const handler = createWebhookHandler({
-    webhookSecret,
-    logger: api.logger,
-    onEvent: (event) => {
-      const actions = routeEvent(event);
-      for (const action of actions) {
-        api.logger.info(
-          `[event-router] ${action.type} agent=${action.agentId} event=${action.event}: ${action.detail}`,
-        );
+  for (const [wsName, wsConfig] of workspaces) {
+    const agentMapping = wsConfig.agentMapping ?? {};
+    if (Object.keys(agentMapping).length === 0) {
+      api.logger.info(`[linear:${wsName}] agentMapping is empty — webhook events will be dropped`);
+    }
 
-        if (action.type === "wake") {
-          activeDebouncerKeys.add(action.agentId);
-          debouncer.enqueue(action);
+    const debounceMs =
+      (typeof wsConfig.debounceMs === "number" && wsConfig.debounceMs > 0)
+        ? wsConfig.debounceMs
+        : globalDebounceMs;
+
+    const routeEvent = createEventRouter({
+      agentMapping,
+      logger: api.logger,
+      eventFilter: wsConfig.eventFilter?.length ? wsConfig.eventFilter : undefined,
+      teamIds: wsConfig.teamIds?.length ? wsConfig.teamIds : undefined,
+      stateActions: wsConfig.stateActions,
+    });
+
+    const queue = queues.get(wsName)!;
+
+    const handler = createWebhookHandler({
+      webhookSecret: wsConfig.webhookSecret,
+      logger: api.logger,
+      onEvent: (event) => {
+        const actions = routeEvent(event);
+        for (const action of actions) {
+          api.logger.info(
+            `[linear:${wsName}] ${action.type} agent=${action.agentId} event=${action.event}: ${action.detail}`,
+          );
+
+          if (action.type === "wake") {
+            activeDebouncerKeys.add(action.agentId);
+            debouncer.enqueue({ ...action, workspaceName: wsName });
+          }
+
+          if (action.type === "notify") {
+            queue
+              .enqueue([
+                {
+                  id: action.commentId || action.identifier,
+                  issueId: action.identifier,
+                  event: action.event,
+                  summary: action.issueLabel,
+                  issuePriority: action.issuePriority,
+                },
+              ])
+              .catch((err) =>
+                api.logger.error(
+                  `[linear:${wsName}] Notify enqueue error: ${formatErrorMessage(err)}`,
+                ),
+              );
+          }
         }
+      },
+    });
 
-        if (action.type === "notify") {
-          queue
-            .enqueue([
-              {
-                id: action.commentId || action.identifier,
-                issueId: action.identifier,
-                event: action.event,
-                summary: action.issueLabel,
-                issuePriority: action.issuePriority,
-              },
-            ])
-            .catch((err) =>
-              api.logger.error(
-                `[linear] Notify enqueue error: ${formatErrorMessage(err)}`,
-              ),
-            );
-        }
-      }
-    },
-  });
+    const webhookPath =
+      workspaces.size === 1
+        ? "/hooks/linear"
+        : `/hooks/linear/${wsName}`;
 
-  api.registerHttpRoute({
-    path: "/hooks/linear",
-    handler,
-  });
+    api.registerHttpRoute({
+      path: webhookPath,
+      handler,
+    });
 
-  api.logger.info(
-    `Linear webhook handler registered at /hooks/linear (debounce: ${debounceMs}ms)`,
-  );
+    api.logger.info(
+      `[linear:${wsName}] Webhook handler registered at ${webhookPath} (debounce: ${debounceMs}ms)`,
+    );
+  }
 }
 
 export async function deactivate(api: OpenClawPluginApi): Promise<void> {

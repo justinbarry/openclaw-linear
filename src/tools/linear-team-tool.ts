@@ -1,7 +1,7 @@
 import { Type, type Static } from "@sinclair/typebox";
 import type { AnyAgentTool } from "openclaw/plugin-sdk";
 import { jsonResult, stringEnum, formatErrorMessage } from "openclaw/plugin-sdk";
-import { graphql } from "../linear-api.js";
+import type { ClientRegistry, LinearClient } from "../linear-api.js";
 
 const Params = Type.Object({
   action: stringEnum(
@@ -17,10 +17,16 @@ const Params = Type.Object({
       description: "Team key (e.g. ENG). Required for members.",
     }),
   ),
+  workspace: Type.Optional(
+    Type.String({
+      description:
+        "Workspace name to use (from plugin config). Defaults to the first configured workspace.",
+    }),
+  ),
 });
 type Params = Static<typeof Params>;
 
-export function createTeamTool(): AnyAgentTool {
+export function createTeamTool(registry: ClientRegistry): AnyAgentTool {
   return {
     name: "linear_team",
     label: "Linear Team",
@@ -28,11 +34,12 @@ export function createTeamTool(): AnyAgentTool {
     parameters: Params,
     async execute(_toolCallId: string, params: Params) {
       try {
+        const client = registry.get(params.workspace);
         switch (params.action) {
           case "list":
-            return await listTeams();
+            return await listTeams(client);
           case "members":
-            return await listMembers(params);
+            return await listMembers(client, params);
           default:
             return jsonResult({
               error: `Unknown action: ${(params as { action: string }).action}`,
@@ -47,8 +54,8 @@ export function createTeamTool(): AnyAgentTool {
   };
 }
 
-async function listTeams() {
-  const data = await graphql<{
+async function listTeams(client: LinearClient) {
+  const data = await client.graphql<{
     teams: {
       nodes: { id: string; name: string; key: string }[];
     };
@@ -57,12 +64,12 @@ async function listTeams() {
   return jsonResult({ teams: data.teams.nodes });
 }
 
-async function listMembers(params: Params) {
+async function listMembers(client: LinearClient, params: Params) {
   if (!params.team) {
     return jsonResult({ error: "team is required for members" });
   }
 
-  const data = await graphql<{
+  const data = await client.graphql<{
     teams: {
       nodes: {
         members: {

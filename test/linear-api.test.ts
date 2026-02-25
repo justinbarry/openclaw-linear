@@ -1,5 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import {
+  LinearClient,
+  ClientRegistry,
   graphql,
   setApiKey,
   _resetApiKey,
@@ -39,7 +41,9 @@ function mockGraphqlError(message: string) {
   });
 }
 
-describe("graphql", () => {
+// --- Legacy shim tests (backward compatibility) ---
+
+describe("graphql (legacy shim)", () => {
   it("throws if API key is not set", async () => {
     await expect(graphql("{ viewer { id } }")).rejects.toThrow(
       "API key not set",
@@ -119,13 +123,13 @@ describe("graphql", () => {
     setApiKey("lin_api_test");
     mockGraphqlError("Entity not found");
 
-    await expect(graphql("{ issue(id: \"bad\") { id } }")).rejects.toThrow(
+    await expect(graphql('{ issue(id: "bad") { id } }')).rejects.toThrow(
       "Entity not found",
     );
   });
 });
 
-describe("resolveIssueId", () => {
+describe("resolveIssueId (legacy shim)", () => {
   beforeEach(() => {
     setApiKey("lin_api_test");
   });
@@ -164,7 +168,7 @@ describe("resolveIssueId", () => {
   });
 });
 
-describe("resolveTeamId", () => {
+describe("resolveTeamId (legacy shim)", () => {
   beforeEach(() => {
     setApiKey("lin_api_test");
   });
@@ -181,7 +185,7 @@ describe("resolveTeamId", () => {
   });
 });
 
-describe("resolveStateId", () => {
+describe("resolveStateId (legacy shim)", () => {
   beforeEach(() => {
     setApiKey("lin_api_test");
   });
@@ -228,7 +232,7 @@ describe("resolveStateId", () => {
   });
 });
 
-describe("resolveUserId", () => {
+describe("resolveUserId (legacy shim)", () => {
   beforeEach(() => {
     setApiKey("lin_api_test");
   });
@@ -245,7 +249,7 @@ describe("resolveUserId", () => {
   });
 });
 
-describe("resolveLabelIds", () => {
+describe("resolveLabelIds (legacy shim)", () => {
   beforeEach(() => {
     setApiKey("lin_api_test");
   });
@@ -285,7 +289,7 @@ describe("resolveLabelIds", () => {
   });
 });
 
-describe("resolveProjectId", () => {
+describe("resolveProjectId (legacy shim)", () => {
   beforeEach(() => {
     setApiKey("lin_api_test");
   });
@@ -303,5 +307,84 @@ describe("resolveProjectId", () => {
     await expect(resolveProjectId("Nonexistent")).rejects.toThrow(
       'Project "Nonexistent" not found',
     );
+  });
+});
+
+// --- LinearClient direct tests ---
+
+describe("LinearClient", () => {
+  it("sends correct headers and body", async () => {
+    const client = new LinearClient("lin_api_direct");
+    mockGraphqlResponse({ viewer: { id: "u1" } });
+
+    await client.graphql("{ viewer { id } }");
+
+    expect(mockFetch).toHaveBeenCalledWith(
+      "https://api.linear.app/graphql",
+      expect.objectContaining({
+        headers: {
+          Authorization: "lin_api_direct",
+          "Content-Type": "application/json",
+        },
+      }),
+    );
+  });
+
+  it("has independent issue ID caches", async () => {
+    const client1 = new LinearClient("key-1");
+    const client2 = new LinearClient("key-2");
+
+    mockGraphqlResponse({ issues: { nodes: [{ id: "uuid-from-ws1" }] } });
+    const id1 = await client1.resolveIssueId("ENG-42");
+    expect(id1).toBe("uuid-from-ws1");
+
+    mockGraphqlResponse({ issues: { nodes: [{ id: "uuid-from-ws2" }] } });
+    const id2 = await client2.resolveIssueId("ENG-42");
+    expect(id2).toBe("uuid-from-ws2");
+
+    // Two separate API calls (not cached across clients)
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+  });
+});
+
+// --- ClientRegistry tests ---
+
+describe("ClientRegistry", () => {
+  it("registers and retrieves workspaces", () => {
+    const reg = new ClientRegistry();
+    const c1 = reg.register("main", "key-1");
+    const c2 = reg.register("partner", "key-2");
+
+    expect(reg.get("main")).toBe(c1);
+    expect(reg.get("partner")).toBe(c2);
+  });
+
+  it("returns first registered as default", () => {
+    const reg = new ClientRegistry();
+    const c1 = reg.register("main", "key-1");
+    reg.register("partner", "key-2");
+
+    expect(reg.get()).toBe(c1);
+    expect(reg.defaultWorkspace()).toBe("main");
+  });
+
+  it("throws on unknown workspace", () => {
+    const reg = new ClientRegistry();
+    reg.register("main", "key-1");
+
+    expect(() => reg.get("nope")).toThrow('Unknown workspace "nope"');
+  });
+
+  it("throws when no workspaces configured", () => {
+    const reg = new ClientRegistry();
+    expect(() => reg.get()).toThrow("No Linear workspaces configured");
+  });
+
+  it("reports names and size", () => {
+    const reg = new ClientRegistry();
+    reg.register("a", "key-a");
+    reg.register("b", "key-b");
+    expect(reg.names()).toEqual(["a", "b"]);
+    expect(reg.size()).toBe(2);
   });
 });

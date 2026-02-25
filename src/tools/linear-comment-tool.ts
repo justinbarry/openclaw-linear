@@ -1,7 +1,7 @@
 import { Type, type Static } from "@sinclair/typebox";
 import type { AnyAgentTool } from "openclaw/plugin-sdk";
 import { jsonResult, stringEnum, formatErrorMessage } from "openclaw/plugin-sdk";
-import { graphql, resolveIssueId } from "../linear-api.js";
+import type { ClientRegistry, LinearClient } from "../linear-api.js";
 
 const Params = Type.Object({
   action: stringEnum(
@@ -34,10 +34,16 @@ const Params = Type.Object({
       description: "Parent comment ID for threading a reply (used with add).",
     }),
   ),
+  workspace: Type.Optional(
+    Type.String({
+      description:
+        "Workspace name to use (from plugin config). Defaults to the first configured workspace.",
+    }),
+  ),
 });
 type Params = Static<typeof Params>;
 
-export function createCommentTool(): AnyAgentTool {
+export function createCommentTool(registry: ClientRegistry): AnyAgentTool {
   return {
     name: "linear_comment",
     label: "Linear Comment",
@@ -46,13 +52,14 @@ export function createCommentTool(): AnyAgentTool {
     parameters: Params,
     async execute(_toolCallId: string, params: Params) {
       try {
+        const client = registry.get(params.workspace);
         switch (params.action) {
           case "list":
-            return await listComments(params);
+            return await listComments(client, params);
           case "add":
-            return await addComment(params);
+            return await addComment(client, params);
           case "update":
-            return await updateComment(params);
+            return await updateComment(client, params);
           default:
             return jsonResult({
               error: `Unknown action: ${(params as { action: string }).action}`,
@@ -67,14 +74,14 @@ export function createCommentTool(): AnyAgentTool {
   };
 }
 
-async function listComments(params: Params) {
+async function listComments(client: LinearClient, params: Params) {
   if (!params.issueId) {
     return jsonResult({ error: "issueId is required for list" });
   }
 
-  const id = await resolveIssueId(params.issueId);
+  const id = await client.resolveIssueId(params.issueId);
 
-  const data = await graphql<{
+  const data = await client.graphql<{
     issue: {
       comments: {
         nodes: {
@@ -108,7 +115,7 @@ async function listComments(params: Params) {
   return jsonResult({ comments: data.issue.comments.nodes });
 }
 
-async function addComment(params: Params) {
+async function addComment(client: LinearClient, params: Params) {
   if (!params.issueId) {
     return jsonResult({ error: "issueId is required for add" });
   }
@@ -116,7 +123,7 @@ async function addComment(params: Params) {
     return jsonResult({ error: "body is required for add" });
   }
 
-  const issueId = await resolveIssueId(params.issueId);
+  const issueId = await client.resolveIssueId(params.issueId);
 
   const input: Record<string, unknown> = {
     issueId,
@@ -126,7 +133,7 @@ async function addComment(params: Params) {
     input.parentId = params.parentCommentId;
   }
 
-  const data = await graphql<{
+  const data = await client.graphql<{
     commentCreate: {
       success: boolean;
       comment: { id: string; body: string };
@@ -144,7 +151,7 @@ async function addComment(params: Params) {
   return jsonResult(data.commentCreate);
 }
 
-async function updateComment(params: Params) {
+async function updateComment(client: LinearClient, params: Params) {
   if (!params.commentId) {
     return jsonResult({ error: "commentId is required for update" });
   }
@@ -152,7 +159,7 @@ async function updateComment(params: Params) {
     return jsonResult({ error: "body is required for update" });
   }
 
-  const data = await graphql<{
+  const data = await client.graphql<{
     commentUpdate: {
       success: boolean;
       comment: { id: string; body: string };

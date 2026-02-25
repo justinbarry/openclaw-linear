@@ -19,11 +19,25 @@ const QueueToolParams = Type.Object({
   issueId: Type.Optional(
     Type.String({ description: "Issue ID to complete (required for 'complete' action)." }),
   ),
+  workspace: Type.Optional(
+    Type.String({
+      description:
+        "Workspace name to use (from plugin config). Defaults to the first configured workspace.",
+    }),
+  ),
 });
 
 type QueueToolParams = Static<typeof QueueToolParams>;
 
-export function createQueueTool(queue: InboxQueue): AnyAgentTool {
+/** Resolve function that returns the InboxQueue for a workspace name. */
+export type QueueResolver = (workspace?: string) => InboxQueue;
+
+export function createQueueTool(queueOrResolver: InboxQueue | QueueResolver): AnyAgentTool {
+  const resolve: QueueResolver =
+    typeof queueOrResolver === "function"
+      ? queueOrResolver
+      : () => queueOrResolver;
+
   return {
     name: "linear_queue",
     label: "Linear Queue",
@@ -33,6 +47,7 @@ export function createQueueTool(queue: InboxQueue): AnyAgentTool {
       "or 'complete' to finish work on a claimed item.",
     parameters: QueueToolParams,
     async execute(_toolCallId: string, params: QueueToolParams) {
+      const queue = resolve(params.workspace);
       switch (params.action) {
         case "peek": {
           const items = await queue.peek();

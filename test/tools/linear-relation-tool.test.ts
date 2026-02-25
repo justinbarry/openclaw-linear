@@ -1,35 +1,45 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-
-vi.mock("../../src/linear-api.js", () => ({
-  graphql: vi.fn(),
-  resolveIssueId: vi.fn(),
-}));
-
-const { graphql, resolveIssueId } = await import("../../src/linear-api.js");
-const { createRelationTool } = await import("../../src/tools/linear-relation-tool.js");
-
-const mockedGraphql = vi.mocked(graphql);
-const mockedResolveIssueId = vi.mocked(resolveIssueId);
+import type { LinearClient, ClientRegistry } from "../../src/linear-api.js";
+import { createRelationTool } from "../../src/tools/linear-relation-tool.js";
 
 function parse(result: { content: { type: string; text?: string }[] }) {
   const text = result.content.find((c) => c.type === "text")?.text;
   return text ? JSON.parse(text) : undefined;
 }
 
+function makeMockClient() {
+  return {
+    graphql: vi.fn(),
+    resolveIssueId: vi.fn(),
+  } as unknown as LinearClient & {
+    graphql: ReturnType<typeof vi.fn>;
+    resolveIssueId: ReturnType<typeof vi.fn>;
+  };
+}
+
+function makeRegistry(client: LinearClient): ClientRegistry {
+  return { get: () => client } as unknown as ClientRegistry;
+}
+
+let mockClient: ReturnType<typeof makeMockClient>;
+let registry: ClientRegistry;
+
 beforeEach(() => {
   vi.clearAllMocks();
+  mockClient = makeMockClient();
+  registry = makeRegistry(mockClient);
 });
 
 describe("linear_relation tool", () => {
   it("has correct name", () => {
-    const tool = createRelationTool();
+    const tool = createRelationTool(registry);
     expect(tool.name).toBe("linear_relation");
   });
 
   describe("list", () => {
     it("returns relations and inverse relations", async () => {
-      mockedResolveIssueId.mockResolvedValue("uuid-1");
-      mockedGraphql.mockResolvedValue({
+      mockClient.resolveIssueId.mockResolvedValue("uuid-1");
+      mockClient.graphql.mockResolvedValue({
         issue: {
           relations: {
             nodes: [
@@ -52,7 +62,7 @@ describe("linear_relation tool", () => {
         },
       });
 
-      const tool = createRelationTool();
+      const tool = createRelationTool(registry);
       const result = await tool.execute("call-1", {
         action: "list",
         issueId: "ENG-1",
@@ -64,7 +74,7 @@ describe("linear_relation tool", () => {
     });
 
     it("returns error without issueId", async () => {
-      const tool = createRelationTool();
+      const tool = createRelationTool(registry);
       const result = await tool.execute("call-1", { action: "list" });
       const data = parse(result);
       expect(data.error).toContain("issueId is required");
@@ -73,17 +83,17 @@ describe("linear_relation tool", () => {
 
   describe("add", () => {
     it("creates a blocks relation", async () => {
-      mockedResolveIssueId
+      mockClient.resolveIssueId
         .mockResolvedValueOnce("uuid-1")
         .mockResolvedValueOnce("uuid-2");
-      mockedGraphql.mockResolvedValue({
+      mockClient.graphql.mockResolvedValue({
         issueRelationCreate: {
           success: true,
           issueRelation: { id: "r-new", type: "blocks" },
         },
       });
 
-      const tool = createRelationTool();
+      const tool = createRelationTool(registry);
       const result = await tool.execute("call-1", {
         action: "add",
         issueId: "ENG-1",
@@ -95,17 +105,17 @@ describe("linear_relation tool", () => {
     });
 
     it("swaps direction for blocked-by", async () => {
-      mockedResolveIssueId
+      mockClient.resolveIssueId
         .mockResolvedValueOnce("uuid-related") // relatedIssueId resolved first for blocked-by
         .mockResolvedValueOnce("uuid-issue");
-      mockedGraphql.mockResolvedValue({
+      mockClient.graphql.mockResolvedValue({
         issueRelationCreate: {
           success: true,
           issueRelation: { id: "r-new", type: "blocks" },
         },
       });
 
-      const tool = createRelationTool();
+      const tool = createRelationTool(registry);
       await tool.execute("call-1", {
         action: "add",
         issueId: "ENG-1",
@@ -114,7 +124,7 @@ describe("linear_relation tool", () => {
       });
 
       // For blocked-by, issueId and relatedIssueId are swapped
-      const call = mockedGraphql.mock.calls[0];
+      const call = mockClient.graphql.mock.calls[0];
       const vars = call[1] as {
         input: { issueId: string; relatedIssueId: string; type: string };
       };
@@ -124,7 +134,7 @@ describe("linear_relation tool", () => {
     });
 
     it("returns error without required fields", async () => {
-      const tool = createRelationTool();
+      const tool = createRelationTool(registry);
 
       let result = await tool.execute("call-1", { action: "add" });
       expect(parse(result).error).toContain("issueId is required");
@@ -146,11 +156,11 @@ describe("linear_relation tool", () => {
 
   describe("delete", () => {
     it("deletes a relation", async () => {
-      mockedGraphql.mockResolvedValue({
+      mockClient.graphql.mockResolvedValue({
         issueRelationDelete: { success: true },
       });
 
-      const tool = createRelationTool();
+      const tool = createRelationTool(registry);
       const result = await tool.execute("call-1", {
         action: "delete",
         relationId: "r1",
@@ -160,7 +170,7 @@ describe("linear_relation tool", () => {
     });
 
     it("returns error without relationId", async () => {
-      const tool = createRelationTool();
+      const tool = createRelationTool(registry);
       const result = await tool.execute("call-1", { action: "delete" });
       const data = parse(result);
       expect(data.error).toContain("relationId is required");
@@ -168,9 +178,9 @@ describe("linear_relation tool", () => {
   });
 
   it("catches and returns API errors", async () => {
-    mockedResolveIssueId.mockRejectedValue(new Error("Connection refused"));
+    mockClient.resolveIssueId.mockRejectedValue(new Error("Connection refused"));
 
-    const tool = createRelationTool();
+    const tool = createRelationTool(registry);
     const result = await tool.execute("call-1", {
       action: "list",
       issueId: "ENG-1",

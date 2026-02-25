@@ -1,35 +1,45 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-
-vi.mock("../../src/linear-api.js", () => ({
-  graphql: vi.fn(),
-  resolveIssueId: vi.fn(),
-}));
-
-const { graphql, resolveIssueId } = await import("../../src/linear-api.js");
-const { createCommentTool } = await import("../../src/tools/linear-comment-tool.js");
-
-const mockedGraphql = vi.mocked(graphql);
-const mockedResolveIssueId = vi.mocked(resolveIssueId);
+import type { LinearClient, ClientRegistry } from "../../src/linear-api.js";
+import { createCommentTool } from "../../src/tools/linear-comment-tool.js";
 
 function parse(result: { content: { type: string; text?: string }[] }) {
   const text = result.content.find((c) => c.type === "text")?.text;
   return text ? JSON.parse(text) : undefined;
 }
 
+function makeMockClient() {
+  return {
+    graphql: vi.fn(),
+    resolveIssueId: vi.fn(),
+  } as unknown as LinearClient & {
+    graphql: ReturnType<typeof vi.fn>;
+    resolveIssueId: ReturnType<typeof vi.fn>;
+  };
+}
+
+function makeRegistry(client: LinearClient): ClientRegistry {
+  return { get: () => client } as unknown as ClientRegistry;
+}
+
+let mockClient: ReturnType<typeof makeMockClient>;
+let registry: ClientRegistry;
+
 beforeEach(() => {
   vi.clearAllMocks();
+  mockClient = makeMockClient();
+  registry = makeRegistry(mockClient);
 });
 
 describe("linear_comment tool", () => {
   it("has correct name", () => {
-    const tool = createCommentTool();
+    const tool = createCommentTool(registry);
     expect(tool.name).toBe("linear_comment");
   });
 
   describe("list", () => {
     it("returns comments for an issue", async () => {
-      mockedResolveIssueId.mockResolvedValue("uuid-1");
-      mockedGraphql.mockResolvedValue({
+      mockClient.resolveIssueId.mockResolvedValue("uuid-1");
+      mockClient.graphql.mockResolvedValue({
         issue: {
           comments: {
             nodes: [
@@ -46,7 +56,7 @@ describe("linear_comment tool", () => {
         },
       });
 
-      const tool = createCommentTool();
+      const tool = createCommentTool(registry);
       const result = await tool.execute("call-1", {
         action: "list",
         issueId: "ENG-42",
@@ -57,7 +67,7 @@ describe("linear_comment tool", () => {
     });
 
     it("returns error without issueId", async () => {
-      const tool = createCommentTool();
+      const tool = createCommentTool(registry);
       const result = await tool.execute("call-1", { action: "list" });
       const data = parse(result);
       expect(data.error).toContain("issueId is required");
@@ -66,15 +76,15 @@ describe("linear_comment tool", () => {
 
   describe("add", () => {
     it("creates a comment", async () => {
-      mockedResolveIssueId.mockResolvedValue("uuid-1");
-      mockedGraphql.mockResolvedValue({
+      mockClient.resolveIssueId.mockResolvedValue("uuid-1");
+      mockClient.graphql.mockResolvedValue({
         commentCreate: {
           success: true,
           comment: { id: "c-new", body: "My comment" },
         },
       });
 
-      const tool = createCommentTool();
+      const tool = createCommentTool(registry);
       const result = await tool.execute("call-1", {
         action: "add",
         issueId: "ENG-42",
@@ -85,15 +95,15 @@ describe("linear_comment tool", () => {
     });
 
     it("supports threading with parentCommentId", async () => {
-      mockedResolveIssueId.mockResolvedValue("uuid-1");
-      mockedGraphql.mockResolvedValue({
+      mockClient.resolveIssueId.mockResolvedValue("uuid-1");
+      mockClient.graphql.mockResolvedValue({
         commentCreate: {
           success: true,
           comment: { id: "c-reply", body: "Reply" },
         },
       });
 
-      const tool = createCommentTool();
+      const tool = createCommentTool(registry);
       await tool.execute("call-1", {
         action: "add",
         issueId: "ENG-42",
@@ -101,13 +111,13 @@ describe("linear_comment tool", () => {
         parentCommentId: "c1",
       });
 
-      const call = mockedGraphql.mock.calls[0];
+      const call = mockClient.graphql.mock.calls[0];
       const vars = call[1] as { input: { parentId?: string } };
       expect(vars.input.parentId).toBe("c1");
     });
 
     it("returns error without issueId", async () => {
-      const tool = createCommentTool();
+      const tool = createCommentTool(registry);
       const result = await tool.execute("call-1", {
         action: "add",
         body: "text",
@@ -117,7 +127,7 @@ describe("linear_comment tool", () => {
     });
 
     it("returns error without body", async () => {
-      const tool = createCommentTool();
+      const tool = createCommentTool(registry);
       const result = await tool.execute("call-1", {
         action: "add",
         issueId: "ENG-42",
@@ -129,14 +139,14 @@ describe("linear_comment tool", () => {
 
   describe("update", () => {
     it("updates a comment", async () => {
-      mockedGraphql.mockResolvedValue({
+      mockClient.graphql.mockResolvedValue({
         commentUpdate: {
           success: true,
           comment: { id: "c1", body: "Updated" },
         },
       });
 
-      const tool = createCommentTool();
+      const tool = createCommentTool(registry);
       const result = await tool.execute("call-1", {
         action: "update",
         commentId: "c1",
@@ -147,7 +157,7 @@ describe("linear_comment tool", () => {
     });
 
     it("returns error without commentId", async () => {
-      const tool = createCommentTool();
+      const tool = createCommentTool(registry);
       const result = await tool.execute("call-1", {
         action: "update",
         body: "text",
@@ -157,7 +167,7 @@ describe("linear_comment tool", () => {
     });
 
     it("returns error without body", async () => {
-      const tool = createCommentTool();
+      const tool = createCommentTool(registry);
       const result = await tool.execute("call-1", {
         action: "update",
         commentId: "c1",
@@ -168,9 +178,9 @@ describe("linear_comment tool", () => {
   });
 
   it("catches and returns API errors", async () => {
-    mockedResolveIssueId.mockRejectedValue(new Error("API down"));
+    mockClient.resolveIssueId.mockRejectedValue(new Error("API down"));
 
-    const tool = createCommentTool();
+    const tool = createCommentTool(registry);
     const result = await tool.execute("call-1", {
       action: "list",
       issueId: "ENG-1",
