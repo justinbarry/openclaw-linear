@@ -431,6 +431,7 @@ export function activate(api: OpenClawPluginApi): void {
 
     api.registerHttpRoute({
       path: webhookPath,
+      auth: "plugin",
       handler,
     });
 
